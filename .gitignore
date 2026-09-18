@@ -1,0 +1,9 @@
+.env
+__pycache__/
+.pytest_cache/
+*.py[cod]
+
+# Large satellite inputs and generated analytical outputs stay outside Git.
+data/
+ml/datasets/
+ml/artifacts/

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import deque
+import asyncio
 from datetime import date, datetime, timedelta, timezone
 from io import BytesIO
 import math
@@ -12,11 +13,14 @@ from typing import Any
 import httpx
 import numpy as np
 from pyproj import Transformer
-from shapely.geometry import box, mapping
-from shapely.ops import transform, unary_union
 import tifffile
+from rasterio.features import geometry_mask, shapes
+from rasterio.transform import from_origin
+from shapely.geometry import mapping, shape
+from shapely.ops import transform
 
 from backend.app.core.config import Settings
+from backend.app.services.cache import AsyncTtlCache
 
 
 COPERNICUS_BURNT_AREA_V4_COLLECTION_ID = "162ee729-86a7-45bc-9cfe-c01f718e3216"
@@ -25,6 +29,8 @@ PIXEL_SIZE_M = 300
 MAX_OUTPUT_PIXELS = 250_000
 
 EQUAL_AREA_TRANSFORMER = Transformer.from_crs("EPSG:4326", "EPSG:6933", always_xy=True)
+_TOKEN_VALUES: dict[Settings, tuple[str, float]] = {}
+_TOKEN_LOCKS: dict[Settings, asyncio.Lock] = {}
 
 EVALSCRIPT = """//VERSION=3
 function setup() {
@@ -149,25 +155,17 @@ def vectorize_burned_area_tiff(
 
     rows, columns = dob.shape
     west, south, east, north = bbox
-    pixel_width = (east - west) / columns
-    pixel_height = (north - south) / rows
+    transform_ = from_origin(west, north, (east - west) / columns, (north - south) / rows)
     features: list[dict[str, Any]] = []
 
     for day_of_burn in sorted(int(value) for value in np.unique(dob) if value > 0):
-        for index, component in enumerate(_components(dob == day_of_burn), start=1):
-            cells = [
-                box(
-                    west + column * pixel_width,
-                    north - (row + 1) * pixel_height,
-                    west + (column + 1) * pixel_width,
-                    north - row * pixel_height,
-                )
-                for row, column in component
-            ]
-            geometry = unary_union(cells)
+        burn_mask = dob == day_of_burn
+        for index, (geometry_mapping, _) in enumerate(shapes(burn_mask.astype("uint8"), mask=burn_mask, transform=transform_), start=1):
+            geometry = shape(geometry_mapping)
             area_ha = transform(EQUAL_AREA_TRANSFORMER.transform, geometry).area / 10_000
-            values = np.array([burned_fraction[row, column] for row, column in component])
-            probabilities = np.array([confidence[row, column] for row, column in component])
+            component_mask = geometry_mask([geometry_mapping], out_shape=burn_mask.shape, transform=transform_, invert=True) & burn_mask
+            values = burned_fraction[component_mask]
+            probabilities = confidence[component_mask]
             feature_id = f"burn-{observation_date:%Y%m%d}-{day_of_burn}-{index}"
             features.append(
                 {
@@ -181,7 +179,7 @@ def vectorize_burned_area_tiff(
                         "burned_fraction": round(float(values.mean()) / 1000, 3),
                         "confidence": round(float(probabilities.mean()) / 1000, 3),
                         "area_ha": round(area_ha, 2),
-                        "pixel_count": len(component),
+                        "pixel_count": int(component_mask.sum()),
                         "resolution_m": PIXEL_SIZE_M,
                         "precision_note": "approximate_300m_product",
                     },
@@ -194,33 +192,38 @@ class CopernicusBurnedAreaClient:
     def __init__(self, settings: Settings, http_client: httpx.AsyncClient | None = None) -> None:
         self.settings = settings
         self.http_client = http_client
-        self._access_token: str | None = None
-        self._token_expires_at = 0.0
+        self._cache = AsyncTtlCache()
 
     def _check_configuration(self) -> None:
         if not self.settings.copernicus_client_id or not self.settings.copernicus_client_secret:
             raise CopernicusConfigurationError("COPERNICUS_CLIENT_ID and COPERNICUS_CLIENT_SECRET are required")
 
     async def _access_token_for(self, client: httpx.AsyncClient) -> str:
-        if self._access_token and time.monotonic() < self._token_expires_at:
-            return self._access_token
-        response = await client.post(
-            self.settings.copernicus_token_url,
-            data={
-                "grant_type": "client_credentials",
-                "client_id": self.settings.copernicus_client_id,
-                "client_secret": self.settings.copernicus_client_secret,
-            },
-        )
-        if response.is_error:
-            raise CopernicusUpstreamError("Copernicus OAuth token request failed")
-        body = response.json()
-        token = body.get("access_token")
-        if not token:
-            raise CopernicusUpstreamError("Copernicus OAuth response contains no access token")
-        self._access_token = str(token)
-        self._token_expires_at = time.monotonic() + max(int(body.get("expires_in", 300)) - 30, 1)
-        return self._access_token
+        cached = _TOKEN_VALUES.get(self.settings)
+        if cached and time.monotonic() < cached[1]:
+            return cached[0]
+        lock = _TOKEN_LOCKS.setdefault(self.settings, asyncio.Lock())
+        async with lock:
+            cached = _TOKEN_VALUES.get(self.settings)
+            if cached and time.monotonic() < cached[1]:
+                return cached[0]
+            response = await client.post(
+                self.settings.copernicus_token_url,
+                data={
+                    "grant_type": "client_credentials",
+                    "client_id": self.settings.copernicus_client_id,
+                    "client_secret": self.settings.copernicus_client_secret,
+                },
+            )
+            if response.is_error:
+                raise CopernicusUpstreamError("Copernicus OAuth token request failed")
+            body = response.json()
+            token = body.get("access_token")
+            if not token:
+                raise CopernicusUpstreamError("Copernicus OAuth response contains no access token")
+            access_token = str(token)
+            _TOKEN_VALUES[self.settings] = (access_token, time.monotonic() + max(int(body.get("expires_in", 300)) - 30, 1))
+            return access_token
 
     async def fetch_burned_areas(
         self, bbox: tuple[float, float, float, float], observation_date: date
@@ -230,6 +233,14 @@ class CopernicusBurnedAreaClient:
             raise ValueError("Burnt Area V4 is available from 2025-01-01")
         if observation_date > datetime.now(timezone.utc).date():
             raise ValueError("date cannot be in the future")
+        return await self._cache.get_or_set(
+            ("burned-areas", bbox, observation_date), 3600,
+            lambda: self._fetch_burned_areas_uncached(bbox, observation_date),
+        )
+
+    async def _fetch_burned_areas_uncached(
+        self, bbox: tuple[float, float, float, float], observation_date: date
+    ) -> list[dict[str, Any]]:
         payload = build_process_payload(bbox, observation_date)
         owns_client = self.http_client is None
         client = self.http_client or httpx.AsyncClient(timeout=self.settings.request_timeout_seconds)
@@ -242,7 +253,7 @@ class CopernicusBurnedAreaClient:
             )
             if response.is_error:
                 raise CopernicusUpstreamError("Copernicus Process API request failed")
-            return vectorize_burned_area_tiff(response.content, bbox, observation_date)
+            return await asyncio.to_thread(vectorize_burned_area_tiff, response.content, bbox, observation_date)
         except httpx.HTTPError as error:
             raise CopernicusUpstreamError("Copernicus is temporarily unavailable") from error
         finally:

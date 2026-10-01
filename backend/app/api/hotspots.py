@@ -1,5 +1,7 @@
 from datetime import date
+from functools import lru_cache
 
+import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 from backend.app.core.config import Settings, get_settings
@@ -20,8 +22,13 @@ def parse_bbox(bbox: str = Query(description="west,south,east,north")) -> tuple[
     return west, south, east, north
 
 
+@lru_cache(maxsize=1)
+def _get_cached_firms_client(settings: Settings) -> FirmsClient:
+    return FirmsClient(settings, httpx.AsyncClient(timeout=settings.request_timeout_seconds))
+
+
 def get_firms_client(settings: Settings = Depends(get_settings)) -> FirmsClient:
-    return FirmsClient(settings)
+    return _get_cached_firms_client(settings)
 
 
 @router.get("/hotspots", response_model=HotspotFeatureCollection)

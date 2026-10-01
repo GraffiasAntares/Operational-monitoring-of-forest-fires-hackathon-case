@@ -17,7 +17,7 @@ def hotspot(identifier: str, latitude: float, longitude: float, acquired_time: s
     )
 
 
-def test_hdbscan_creates_two_events_and_marks_singleton_as_noise():
+def test_hdbscan_creates_two_events_and_keeps_singleton_as_candidate():
     detections = [
         hotspot("a1", 56.1200, 92.8400, "0600"),
         hotspot("a2", 56.1210, 92.8410, "0630"),
@@ -30,7 +30,29 @@ def test_hdbscan_creates_two_events_and_marks_singleton_as_noise():
 
     events, noise_count = FireEventClusterer(cluster_selection_epsilon_m=1_500).cluster(detections)
 
-    assert len(events) == 2
-    assert [event.hotspot_count for event in events] == [3, 3]
+    assert len(events) == 3
+    assert [event.hotspot_count for event in events] == [3, 3, 1]
     assert noise_count == 1
     assert events[0].max_frp == 5.0
+    assert events[0].observation_zone["type"] in {"Polygon", "MultiPolygon"}
+    assert events[0].observation_zone_area_ha > 0
+    assert len(events[0].hotspot_ids) == 3
+    assert events[-1].classification == "candidate"
+
+
+def test_links_fire_growth_between_time_windows():
+    detections = [
+        hotspot("a1", 56.1200, 92.8400, "0600"),
+        hotspot("a2", 56.1210, 92.8410, "0630"),
+        hotspot("a3", 56.1190, 92.8390, "0700"),
+        hotspot("b1", 56.1300, 92.8500, "1800"),
+        hotspot("b2", 56.1310, 92.8510, "1830"),
+        hotspot("b3", 56.1290, 92.8490, "1900"),
+    ]
+
+    events, candidate_count = FireEventClusterer().cluster(detections)
+
+    assert len(events) == 1
+    assert events[0].hotspot_count == 6
+    assert events[0].classification == "confirmed"
+    assert candidate_count == 0

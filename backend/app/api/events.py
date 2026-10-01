@@ -1,4 +1,5 @@
 from datetime import date
+from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
@@ -17,6 +18,7 @@ async def get_fire_events(
     days: int = Query(default=1, ge=1, le=5),
     start_date: date | None = Query(default=None),
     min_cluster_size: int = Query(default=3, ge=2, le=50),
+    sensitivity: Literal["strict", "normal", "aggressive"] = Query(default="normal"),
     firms: FirmsClient = Depends(get_firms_client),
 ) -> FireEventFeatureCollection:
     try:
@@ -26,16 +28,18 @@ async def get_fire_events(
     except FirmsUpstreamError as error:
         raise HTTPException(status_code=502, detail="FIRMS is temporarily unavailable") from error
 
-    clusterer = FireEventClusterer(min_cluster_size=min_cluster_size)
-    events, noise_count = clusterer.cluster(hotspots)
+    clusterer = FireEventClusterer(min_cluster_size=min_cluster_size, sensitivity=sensitivity)
+    events, candidate_count = clusterer.cluster(hotspots)
     return FireEventFeatureCollection(
         features=[event.as_geojson_feature() for event in events],
         metadata={
             "bbox": list(bbox),
             "hotspot_count": len(hotspots),
             "event_count": len(events),
-            "noise_hotspot_count": noise_count,
+            "candidate_hotspot_count": candidate_count,
             "min_cluster_size": min_cluster_size,
-            "time_scale_m_per_hour": clusterer.time_scale_m_per_hour,
+            "sensitivity": sensitivity,
+            "window_hours": clusterer.window_hours,
+            "spread_rate_m_per_hour": clusterer.spread_rate_m_per_hour,
         },
     )

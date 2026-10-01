@@ -1,0 +1,23 @@
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    env_file: .env
+    environment:
+      BS_MODEL_PATH: /models/bs_unet_full_tuned_seed42/best.pt
+      BS_PREPROCESSING_PATH: /models/bs_preprocessing_seed42.npz
+      OMP_NUM_THREADS: "2"
+    volumes:
+      - ./ml/artifacts:/models:ro
+    restart: unless-stopped
+  frontend:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+    ports:
+      - "127.0.0.1:${APP_PORT:-8080}:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped

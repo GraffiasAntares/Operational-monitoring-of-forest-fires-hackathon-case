@@ -4,20 +4,23 @@ from __future__ import annotations
 from datetime import date, timedelta
 from io import BytesIO
 import math
+import asyncio
 from typing import Any
 
 import httpx
 import numpy as np
-from shapely.geometry import box, mapping
-from shapely.ops import transform, unary_union
 import tifffile
+from rasterio.features import geometry_mask, shapes
+from rasterio.transform import from_origin
+from shapely.geometry import mapping, shape
+from shapely.ops import transform
 
 from backend.app.core.config import Settings
+from backend.app.services.cache import AsyncTtlCache
 from backend.app.services.copernicus_burned_area import (
     CopernicusBurnedAreaClient,
     CopernicusUpstreamError,
     EQUAL_AREA_TRANSFORMER,
-    _components,
 )
 
 PIXEL_SIZE_M = 20
@@ -73,11 +76,21 @@ class DnbrClient(CopernicusBurnedAreaClient):
             raise ValueError("before_date must be earlier than after_date")
         if window_days < 0 or window_days > 30:
             raise ValueError("window_days must be between 0 and 30")
+        return await self._cache.get_or_set(
+            ("dnbr", bbox, before, after, window_days), 3600,
+            lambda: self._calculate_uncached(bbox, before, after, window_days),
+        )
+
+    async def _calculate_uncached(self, bbox: tuple[float, float, float, float], before: date, after: date, window_days: int) -> list[dict[str, Any]]:
         owns = self.http_client is None
         client = self.http_client or httpx.AsyncClient(timeout=self.settings.request_timeout_seconds)
         try:
-            before_nir, before_swir, before_scl, before_mask = await self._scene(client, bbox, before, window_days)
-            after_nir, after_swir, after_scl, after_mask = await self._scene(client, bbox, after, window_days)
+            before_scene, after_scene = await asyncio.gather(
+                self._scene(client, bbox, before, window_days),
+                self._scene(client, bbox, after, window_days),
+            )
+            before_nir, before_swir, before_scl, before_mask = before_scene
+            after_nir, after_swir, after_scl, after_mask = after_scene
         except httpx.HTTPError as error:
             raise CopernicusUpstreamError("Copernicus is temporarily unavailable") from error
         finally:
@@ -89,7 +102,7 @@ class DnbrClient(CopernicusBurnedAreaClient):
         # SCL excludes cloud, cirrus, cloud-shadow, snow and no-data pixels.
         usable_scl = np.isin(before_scl, [4, 5, 7]) & np.isin(after_scl, [4, 5, 7])
         valid = (before_mask > 0) & (after_mask > 0) & usable_scl & np.isfinite(dnbr)
-        return vectorize_dnbr(dnbr, valid, bbox, before, after)
+        return await asyncio.to_thread(vectorize_dnbr, dnbr, valid, bbox, before, after)
 
 
 def vectorize_dnbr(dnbr: np.ndarray, valid: np.ndarray, bbox: tuple[float, float, float, float], before: date, after: date) -> list[dict[str, Any]]:
@@ -99,9 +112,11 @@ def vectorize_dnbr(dnbr: np.ndarray, valid: np.ndarray, bbox: tuple[float, float
     features: list[dict[str, Any]] = []
     for label, lower, upper in classes:
         mask = valid & (dnbr >= lower) & (dnbr < upper)
-        for index, component in enumerate(_components(mask), 1):
-            geometry = unary_union([box(west + c * (east-west)/columns, north - (r+1)*(north-south)/rows, west + (c+1)*(east-west)/columns, north-r*(north-south)/rows) for r,c in component])
+        transform_ = from_origin(west, north, (east - west) / columns, (north - south) / rows)
+        for index, (geometry_mapping, _) in enumerate(shapes(mask.astype("uint8"), mask=mask, transform=transform_), 1):
+            geometry = shape(geometry_mapping)
             area = transform(EQUAL_AREA_TRANSFORMER.transform, geometry).area / 10_000
-            values = [float(dnbr[r,c]) for r,c in component]
-            features.append({"type":"Feature", "id":f"dnbr-{after:%Y%m%d}-{label}-{index}", "geometry":mapping(geometry), "properties":{"method":"dNBR", "severity":label, "before_date":before.isoformat(), "after_date":after.isoformat(), "mean_dnbr":round(sum(values)/len(values), 3), "area_ha":round(area,2), "pixel_count":len(component), "resolution_m":PIXEL_SIZE_M}})
+            component_mask = geometry_mask([geometry_mapping], out_shape=mask.shape, transform=transform_, invert=True) & mask
+            values = dnbr[component_mask]
+            features.append({"type":"Feature", "id":f"dnbr-{after:%Y%m%d}-{label}-{index}", "geometry":mapping(geometry), "properties":{"method":"dNBR", "severity":label, "before_date":before.isoformat(), "after_date":after.isoformat(), "mean_dnbr":round(float(values.mean()), 3), "area_ha":round(area,2), "pixel_count":int(component_mask.sum()), "resolution_m":PIXEL_SIZE_M}})
     return features

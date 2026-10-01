@@ -5,9 +5,12 @@ import math
 from typing import Any
 import numpy as np
 import rasterio
-from rasterio.features import geometry_mask
+from rasterio.features import geometry_mask, shapes
 from rasterio.windows import from_bounds
-from shapely.geometry import shape
+from shapely.geometry import mapping, shape
+from shapely.ops import transform, unary_union
+
+from backend.app.services.copernicus_burned_area import EQUAL_AREA_TRANSFORMER
 
 TREE_COVER_CLASS = 10
 MAX_WORLDCOVER_PIXELS = 1_500_000
@@ -26,8 +29,10 @@ def _tile_origins(bbox: tuple[float, float, float, float]):
             yield latitude, longitude
 
 def forest_impact(features: list[dict[str, Any]], bbox: tuple[float, float, float, float]) -> tuple[list[dict[str, Any]], float]:
-    geometries = [shape(feature["geometry"]) for feature in features]
-    forest_ha = [0.0] * len(features)
+    if not features:
+        return [], 0.0
+    analysis_geometry = unary_union([shape(feature["geometry"]) for feature in features])
+    forest_geometries: list[Any] = []
     for latitude, longitude in _tile_origins(bbox):
         with rasterio.Env(CPL_VSIL_CURL_ALLOWED_EXTENSIONS=".tif"):
             with rasterio.open(_tile_url(latitude, longitude)) as dataset:
@@ -44,9 +49,27 @@ def forest_impact(features: list[dict[str, Any]], bbox: tuple[float, float, floa
                 tree = labels == TREE_COVER_CLASS
                 if not tree.any():
                     continue
-                row_area_m2 = 111_320 * 110_574 * abs(affine.a * affine.e) * np.cos(np.radians(affine.f + (np.arange(labels.shape[0]) + .5) * affine.e))
-                for index, geometry in enumerate(geometries):
-                    inside = geometry_mask([geometry], out_shape=labels.shape, transform=affine, invert=True)
-                    forest_ha[index] += float((tree & inside).sum(axis=1).dot(row_area_m2) / 10_000)
-    annotated = [{**feature, "properties": {**feature["properties"], "worldcover_year": 2021, "worldcover_class": "Tree cover", "forest_burned_ha": round(area, 2)}} for feature, area in zip(features, forest_ha, strict=True)]
-    return annotated, round(sum(forest_ha), 2)
+                inside = geometry_mask([analysis_geometry], out_shape=labels.shape, transform=affine, invert=True)
+                forest_mask = tree & inside
+                if not forest_mask.any():
+                    continue
+                forest_geometries.extend(
+                    shape(geometry_mapping)
+                    for geometry_mapping, _ in shapes(forest_mask.astype("uint8"), mask=forest_mask, transform=affine)
+                )
+
+    if not forest_geometries:
+        return [], 0.0
+    forest_geometry = unary_union(forest_geometries)
+    total_forest_ha = transform(EQUAL_AREA_TRANSFORMER.transform, forest_geometry).area / 10_000
+    return [{
+        "type": "Feature",
+        "id": "forest-impact",
+        "geometry": mapping(forest_geometry),
+        "properties": {
+            "source_feature_count": len(features),
+            "worldcover_year": 2021,
+            "worldcover_class": "Tree cover",
+            "forest_burned_ha": round(total_forest_ha, 2),
+        },
+    }], round(total_forest_ha, 2)

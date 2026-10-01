@@ -15,6 +15,11 @@ class FireEvent(BaseModel):
     max_frp: float | None
     mean_confidence: float | None
     source_counts: dict[str, int]
+    hotspot_ids: list[str]
+    observation_zone: dict[str, Any]
+    observation_zone_area_ha: float
+    classification: str
+    quality_score: float
 
     def as_geojson_feature(self) -> dict[str, Any]:
         return {
@@ -32,6 +37,12 @@ class FireEvent(BaseModel):
                 "max_frp": self.max_frp,
                 "mean_confidence": self.mean_confidence,
                 "source_counts": self.source_counts,
+                "hotspot_ids": self.hotspot_ids,
+                "observation_zone": self.observation_zone,
+                "observation_zone_area_ha": self.observation_zone_area_ha,
+                "observation_zone_note": "Approximate satellite-observation zone; not a fire perimeter.",
+                "classification": self.classification,
+                "quality_score": self.quality_score,
             },
         }
 

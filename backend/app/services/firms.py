@@ -1,4 +1,5 @@
 import csv
+import asyncio
 from datetime import date
 from io import StringIO
 
@@ -6,6 +7,7 @@ import httpx
 
 from backend.app.core.config import Settings
 from backend.app.models.hotspot import Hotspot
+from backend.app.services.cache import AsyncTtlCache
 
 
 FIRMS_NRT_SOURCES = ("VIIRS_SNPP_NRT", "VIIRS_NOAA20_NRT")
@@ -26,6 +28,7 @@ class FirmsClient:
     def __init__(self, settings: Settings, http_client: httpx.AsyncClient | None = None):
         self.settings = settings
         self.http_client = http_client
+        self._cache = AsyncTtlCache()
 
     async def fetch_hotspots(
         self, bbox: tuple[float, float, float, float], days: int, start_date: date | None = None
@@ -33,14 +36,20 @@ class FirmsClient:
         if not self.settings.firms_map_key:
             raise FirmsConfigurationError("FIRMS_MAP_KEY is not configured")
 
+        key = (bbox, days, start_date)
+        ttl_seconds = 3600 if start_date else 300
+        return await self._cache.get_or_set(key, ttl_seconds, lambda: self._fetch_uncached(bbox, days, start_date))
+
+    async def _fetch_uncached(
+        self, bbox: tuple[float, float, float, float], days: int, start_date: date | None
+    ) -> list[Hotspot]:
         sources = FIRMS_STANDARD_SOURCES if start_date else FIRMS_NRT_SOURCES
         own_client = self.http_client is None
         client = self.http_client or httpx.AsyncClient(timeout=self.settings.request_timeout_seconds)
         try:
-            batches = [
-                await self._fetch_source(client, source, bbox, days, start_date)
-                for source in sources
-            ]
+            batches = await asyncio.gather(
+                *(self._fetch_source(client, source, bbox, days, start_date) for source in sources)
+            )
         finally:
             if own_client:
                 await client.aclose()

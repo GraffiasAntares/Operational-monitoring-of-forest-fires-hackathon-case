@@ -1,6 +1,7 @@
 from datetime import date
 from functools import lru_cache
 
+import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 from backend.app.api.hotspots import parse_bbox
@@ -19,7 +20,9 @@ router = APIRouter(prefix="/api/v1", tags=["burned areas"])
 
 @lru_cache(maxsize=1)
 def _get_cached_client(settings: Settings) -> CopernicusBurnedAreaClient:
-    return CopernicusBurnedAreaClient(settings)
+    return CopernicusBurnedAreaClient(
+        settings, httpx.AsyncClient(timeout=settings.request_timeout_seconds)
+    )
 
 
 def get_copernicus_client(settings: Settings = Depends(get_settings)) -> CopernicusBurnedAreaClient:

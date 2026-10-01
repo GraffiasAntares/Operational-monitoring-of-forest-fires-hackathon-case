@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from functools import lru_cache
 import os
 from pathlib import Path
 
@@ -13,7 +14,10 @@ class Settings:
         "https://identity.dataspace.copernicus.eu/auth/realms/CDSE/protocol/openid-connect/token"
     )
     copernicus_process_url: str = "https://sh.dataspace.copernicus.eu/api/v1/process"
+    copernicus_catalog_url: str = "https://sh.dataspace.copernicus.eu/catalog/v1/search"
     safe_model_path: str | None = None
+    bs_model_path: str | None = None
+    bs_preprocessing_path: str | None = None
     request_timeout_seconds: float = 20.0
 
 
@@ -30,6 +34,7 @@ def _load_local_env_file() -> None:
         os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
 
 
+@lru_cache(maxsize=1)
 def get_settings() -> Settings:
     _load_local_env_file()
     return Settings(
@@ -37,4 +42,6 @@ def get_settings() -> Settings:
         copernicus_client_id=os.getenv("COPERNICUS_CLIENT_ID"),
         copernicus_client_secret=os.getenv("COPERNICUS_CLIENT_SECRET"),
         safe_model_path=os.getenv("SAFE_MODEL_PATH"),
+        bs_model_path=os.getenv("BS_MODEL_PATH") or str(Path(__file__).resolve().parents[3] / "ml/artifacts/bs_unet_full_tuned_seed42/best.pt"),
+        bs_preprocessing_path=os.getenv("BS_PREPROCESSING_PATH") or str(Path(__file__).resolve().parents[3] / "ml/artifacts/bs_preprocessing_seed42.npz"),
     )

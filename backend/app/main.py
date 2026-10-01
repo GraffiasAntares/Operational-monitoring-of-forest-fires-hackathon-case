@@ -6,6 +6,8 @@ from backend.app.api.events import router as events_router
 from backend.app.api.hotspots import router as hotspots_router
 from backend.app.api.safe import router as safe_router
 from backend.app.api.forest_impact import router as forest_impact_router
+from backend.app.api.scene_preview import router as scene_preview_router
+from backend.app.api.timeline import router as timeline_router
 
 
 app = FastAPI(title="Forest Fire Monitoring API", version="0.1.0")
@@ -14,6 +16,8 @@ app.include_router(events_router)
 app.include_router(burned_areas_router)
 app.include_router(dnbr_router)
 app.include_router(forest_impact_router)
+app.include_router(scene_preview_router)
+app.include_router(timeline_router)
 app.include_router(safe_router)
 
 
